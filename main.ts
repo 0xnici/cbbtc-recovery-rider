@@ -110,10 +110,10 @@ function entrySignal(state: BarsState): boolean {
   if (offLow < OFF_LOW) return false;
   if (close < ema * (1 - EMA_TOLERANCE)) return false;
   if (entries === 0) return fast >= ENTER_FAST && slow >= ENTER_SLOW;
-  // A re-entry must prove the trend resumed: stronger slow momentum, and a
-  // close above every close since the exit — the chop after an exit has
-  // neither.
-  return slow >= REENTER_SLOW && close > highSinceExit;
+  // A re-entry must prove the trend resumed: stronger slow momentum, a close
+  // above every close since the exit, and the fast window at least half-way
+  // to its first-entry strength — the chop after an exit has none of these.
+  return slow >= REENTER_SLOW && fast >= ENTER_FAST / 2 && close > highSinceExit;
 }
 
 function exitSignal(): boolean {
