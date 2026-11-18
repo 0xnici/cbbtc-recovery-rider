@@ -120,12 +120,17 @@ function wantsEntry(): boolean {
 }
 
 function wantsExit(): boolean {
+  // The give-back rule fires first: an hour that has already surrendered
+  // 0.25% says the move is over without waiting for the trailing stop.
   const hourRet = returnOver(HOUR);
   if (hourRet !== null && hourRet <= GIVE_BACK) return true;
+  // Otherwise the trailing stop decides. Its distance shrinks once the
+  // trade is armed (+1.2% over the fill), so a winner keeps less room.
   const latest = closeHistory[closeHistory.length - 1]!;
   const armed = entryFillPrice > 0 && latest >= entryFillPrice * (1 + ARM_AT);
-  const trail = armed ? TRAIL_NEAR : TRAIL_WIDE;
-  return bestCloseInTrade > 0 && latest <= bestCloseInTrade * (1 - trail);
+  const trailDistance = armed ? TRAIL_NEAR : TRAIL_WIDE;
+  const stopLevel = bestCloseInTrade * (1 - trailDistance);
+  return bestCloseInTrade > 0 && latest <= stopLevel;
 }
 
 // ---- main loop ---------------------------------------------------------
