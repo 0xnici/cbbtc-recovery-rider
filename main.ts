@@ -1,176 +1,193 @@
-// Recovery rider — a long-only cbBTC/USDC bot for agent-fun/bars-replay/v1.
+// Confirmed-reversal rider for cbBTC/USDC — bars-replay/v1.
 //
-// The race this enters grades twice: a frozen dev window decides who races,
-// then a live 24-hour window decides the prizes. Both windows punish the two
-// easy bots: buying and holding loses every falling day, and a fast crossover
-// whipsaws itself to death on fees (a full-size round trip costs ~26 bps).
-// This bot therefore trades rarely and only on confirmation:
+// Why this bot trades so rarely: in this replay a round trip at full size
+// costs roughly 26 bps once the fee, the modelled slippage and the pool
+// impact are added up, and the dev gate only lets a bot race when its dev
+// window ends in profit. A bot that chases every wiggle pays that toll over
+// and over; a bot that simply buys and holds loses on every falling day.
+// So each hello starts a long watch, and a batch only produces orders when
+// several independent readings agree that a fall has genuinely reversed:
 //
-//   Entry (flat): the last hour is up at least +0.50% AND the last four hours
-//   are up at least +0.20% AND the close sits at least +0.80% above the low
-//   of the last six hours AND at most 1% under the 240-bar EMA. Two momentum
-//   windows agreeing, off a real low, is a recovery under way — not the first
-//   bounce inside a crash, which fails the four-hour test, and not a rally
-//   that started from nowhere, which fails the off-low test.
+//   First entry, while flat — the return over the last 60 bars is at least
+//   +0.50%, the return over the last 240 bars is at least +0.20%, the
+//   latest close is at least +0.80% above the lowest close of the last
+//   360 bars, and the close is no more than 1% below the 240-bar EMA.
+//   The two momentum windows filter out the first bounce inside a crash
+//   (the four-hour window is still negative there), and the distance
+//   above the low filters out rallies that began from nowhere.
 //
-//   Exit (holding): the first sign the move is over — the last hour gives
-//   back 0.25%, or the close falls 0.75% under the highest close since the
-//   fill. Once the trade is +1.2% above its fill price the trailing stop
-//   tightens to 0.45%, so a good trade keeps most of what it made.
+//   Exit, while holding — the last 60 bars give back 0.25%, or the close
+//   drops 0.75% below the highest close seen since the fill. After the
+//   trade has gained +1.2% over its fill price the trailing distance
+//   tightens to 0.45%, banking most of a good move before it can fade.
 //
-//   Re-entry: allowed, but the bar is far higher than for the first entry —
-//   the four-hour momentum must reach +0.60% and the close must beat every
-//   close since the exit. Chop after an exit never qualifies; only a trend
-//   that resumes to new highs does.
+//   Later entries — the bar is set much higher than for the first one:
+//   the 240-bar return must reach +0.60%, the 60-bar return at least
+//   +0.25%, and the close must exceed every close printed since the
+//   previous exit. Post-exit chop meets none of those; a trend that
+//   resumes to fresh highs meets all of them.
 //
-// Sizing is all-in (one symbol, the weight cap is 100%): with impact near
-// 10 bps on a full-size order against this pool's depth, splitting a position
-// across bars would pay the fee and slippage twice for nothing. Every order
-// caps its slippage at 150 bps past the close it was decided on, so a gap
-// through a thin minute refuses the fill instead of taking a bad price.
+// Sizing is a single all-in order: the weight room for the one symbol is
+// 100% of equity, and splitting an order over several bars would pay the
+// fee and slippage twice against the same pool depth. Every order caps
+// slippage at 150 bps from the close it was decided on, so a gap through
+// a thin bar refuses the fill instead of accepting a bad price.
 //
-// Determinism: every decision is a pure function of the bars and fills the
-// harness sent — no clock, no environment, no randomness. Indicators run in
-// float64 on + - * / alone, so two runs of the same window agree exactly.
+// The bot is deterministic: decisions depend only on the bars and fills
+// in the batches it has received — no wall clock, no environment, no
+// randomness — and the arithmetic is float64 addition, subtraction,
+// multiplication and division only, so two runs over one window produce
+// identical orders.
 
 import { runBars, type BarsState, type Batch, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-const SYMBOL = 'CBBTC';
+const ASSET = 'CBBTC';
 
-/** Momentum windows, in bars (one bar is one minute). */
-const MOM_FAST = 60;
-const MOM_SLOW = 240;
-/** The trailing low and the trend EMA share the slow horizon's scale. */
-const LOW_SPAN = 360;
-const EMA_SPAN = 240;
+// Horizons, counted in one-minute bars.
+const HOUR = 60;
+const FOUR_HOURS = 240;
+const SIX_HOURS = 360;
+const TREND_SPAN = 240;
 
-/** First-entry thresholds, as fractions of price. */
-const ENTER_FAST = 0.005;
-const ENTER_SLOW = 0.002;
-const OFF_LOW = 0.008;
-const EMA_TOLERANCE = 0.01;
+// First-entry gates, as price fractions.
+const GATE_HOUR = 0.005;
+const GATE_FOUR_HOUR = 0.002;
+const GATE_OFF_LOW = 0.008;
+const GATE_EMA_GAP = 0.01;
 
-/** Exit thresholds. */
-const EXIT_FAST = -0.0025;
-const TRAIL = 0.0075;
-const TRAIL_TIGHT = 0.0045;
-const PROFIT_ARM = 0.012;
+// Exit gates.
+const GIVE_BACK = -0.0025;
+const TRAIL_WIDE = 0.0075;
+const TRAIL_NEAR = 0.0045;
+const ARM_AT = 0.012;
 
-/** A re-entry needs this much four-hour momentum and a close above the post-exit high. */
-const REENTER_SLOW = 0.006;
+// Re-entry gates.
+const GATE_RESUME_SLOW = 0.006;
+const GATE_RESUME_FAST = 0.0025;
 
-/** No fill may land further than this from the close the order was decided on. */
-const MAX_SLIPPAGE_BPS = 150;
+// Slippage ceiling carried by every order, in basis points.
+const SLIPPAGE_CAP = 150;
 
-/** Every close the harness has sent, in order; a minute with no bar adds nothing. */
-const closes: number[] = [];
-/** The 240-bar EMA of the closes, seeded on the first close. */
-let ema: number | null = null;
-/** Highest close since the current position filled; 0 while flat. */
-let peakClose = 0;
-/** The price the current position filled at (its bar's fill price); 0 while flat. */
-let fillPrice = 0;
-/** How many buys have filled this run. */
-let entries = 0;
-/** Highest close since the last exit; a re-entry must close above it. */
-let highSinceExit = 0;
-/** Whether the previous batch still held the position (to spot the exit bar). */
-let wasHolding = false;
+// ---- run state -------------------------------------------------------
 
-function stepIndicators(close: number): void {
-  if (ema === null) ema = close;
-  else ema += (2 / (EMA_SPAN + 1)) * (close - ema);
-}
+const closeHistory: number[] = [];
+let trendEma: number | null = null;
+let bestCloseInTrade = 0;
+let entryFillPrice = 0;
+let filledBuys = 0;
+let bestCloseAfterExit = 0;
+let heldLastBatch = false;
 
-/** Return of the close over the last `span` bars, or null before enough bars exist. */
-function trailingReturn(span: number): number | null {
-  if (closes.length <= span) return null;
-  const now = closes[closes.length - 1]!;
-  const then = closes[closes.length - 1 - span]!;
-  return now / then - 1;
-}
-
-/** How far the latest close sits above the lowest close of the last LOW_SPAN bars. */
-function distanceAboveLow(): number | null {
-  if (closes.length < MOM_SLOW) return null;
-  const now = closes[closes.length - 1]!;
-  let low = now;
-  for (let i = Math.max(0, closes.length - LOW_SPAN); i < closes.length; i++) {
-    if (closes[i]! < low) low = closes[i]!;
+function advanceTrend(close: number): void {
+  if (trendEma === null) {
+    trendEma = close;
+    return;
   }
-  return now / low - 1;
+  const alpha = 2 / (TREND_SPAN + 1);
+  trendEma = trendEma + alpha * (close - trendEma);
 }
 
-function entrySignal(state: BarsState): boolean {
-  const fast = trailingReturn(MOM_FAST);
-  const slow = trailingReturn(MOM_SLOW);
-  const offLow = distanceAboveLow();
-  if (fast === null || slow === null || offLow === null || ema === null) return false;
-  const close = closes[closes.length - 1]!;
-  if (offLow < OFF_LOW) return false;
-  if (close < ema * (1 - EMA_TOLERANCE)) return false;
-  if (entries === 0) return fast >= ENTER_FAST && slow >= ENTER_SLOW;
-  // A re-entry must prove the trend resumed: stronger slow momentum, a close
-  // above every close since the exit, and the fast window at least half-way
-  // to its first-entry strength — the chop after an exit has none of these.
-  return slow >= REENTER_SLOW && fast >= ENTER_FAST / 2 && close > highSinceExit;
+function returnOver(span: number): number | null {
+  if (closeHistory.length <= span) return null;
+  const latest = closeHistory[closeHistory.length - 1]!;
+  const earlier = closeHistory[closeHistory.length - 1 - span]!;
+  return latest / earlier - 1;
 }
 
-function exitSignal(): boolean {
-  const fast = trailingReturn(MOM_FAST);
-  const close = closes[closes.length - 1]!;
-  if (fast !== null && fast <= EXIT_FAST) return true;
-  const trail = fillPrice > 0 && close >= fillPrice * (1 + PROFIT_ARM) ? TRAIL_TIGHT : TRAIL;
-  return peakClose > 0 && close <= peakClose * (1 - trail);
+function liftAboveRecentLow(): number | null {
+  if (closeHistory.length < FOUR_HOURS) return null;
+  const latest = closeHistory[closeHistory.length - 1]!;
+  let low = latest;
+  const start = Math.max(0, closeHistory.length - SIX_HOURS);
+  for (let i = start; i < closeHistory.length; i++) {
+    if (closeHistory[i]! < low) low = closeHistory[i]!;
+  }
+  return latest / low - 1;
 }
+
+function wantsEntry(): boolean {
+  const hourRet = returnOver(HOUR);
+  const fourHourRet = returnOver(FOUR_HOURS);
+  const lift = liftAboveRecentLow();
+  if (hourRet === null || fourHourRet === null || lift === null || trendEma === null) return false;
+  const latest = closeHistory[closeHistory.length - 1]!;
+  if (lift < GATE_OFF_LOW) return false;
+  if (latest < trendEma * (1 - GATE_EMA_GAP)) return false;
+  if (filledBuys === 0) {
+    return hourRet >= GATE_HOUR && fourHourRet >= GATE_FOUR_HOUR;
+  }
+  return fourHourRet >= GATE_RESUME_SLOW && hourRet >= GATE_RESUME_FAST && latest > bestCloseAfterExit;
+}
+
+function wantsExit(): boolean {
+  const hourRet = returnOver(HOUR);
+  if (hourRet !== null && hourRet <= GIVE_BACK) return true;
+  const latest = closeHistory[closeHistory.length - 1]!;
+  const armed = entryFillPrice > 0 && latest >= entryFillPrice * (1 + ARM_AT);
+  const trail = armed ? TRAIL_NEAR : TRAIL_WIDE;
+  return bestCloseInTrade > 0 && latest <= bestCloseInTrade * (1 - trail);
+}
+
+// ---- main loop ---------------------------------------------------------
 
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
-    // Bookkeeping first: fills the harness reports belong to orders decided
-    // on earlier batches, and they set the state this batch decides from.
+    // Fills first: they report orders decided on earlier batches, and the
+    // position they opened or closed is what this batch decides from.
     for (const fill of batch.fills) {
-      if (fill.symbol !== SYMBOL || fill.status !== 'filled') continue;
+      if (fill.symbol !== ASSET || fill.status !== 'filled') continue;
       if (fill.side === 'buy') {
-        entries += 1;
-        fillPrice = Number(fill.price);
-        peakClose = closes.length > 0 ? closes[closes.length - 1]! : 0;
+        filledBuys += 1;
+        entryFillPrice = Number(fill.price);
+        bestCloseInTrade = closeHistory.length > 0 ? closeHistory[closeHistory.length - 1]! : 0;
       }
     }
+
+    // Then fold every new bar into the history and the running marks.
     for (const bar of batch.bars) {
-      if (bar.symbol !== SYMBOL) continue;
+      if (bar.symbol !== ASSET) continue;
       const close = Number(bar.c);
-      closes.push(close);
-      stepIndicators(close);
-      if (state.positions.has(SYMBOL)) {
-        if (close > peakClose) peakClose = close;
-      } else if (wasHolding || entries > 0) {
-        if (close > highSinceExit) highSinceExit = close;
+      closeHistory.push(close);
+      advanceTrend(close);
+      if (state.positions.has(ASSET)) {
+        if (close > bestCloseInTrade) bestCloseInTrade = close;
+      } else if (heldLastBatch || filledBuys > 0) {
+        if (close > bestCloseAfterExit) bestCloseAfterExit = close;
       }
     }
-    const holding = state.positions.has(SYMBOL);
-    if (wasHolding && !holding) {
-      // The position left on this batch's fills: the post-exit high starts
-      // from the latest close, and the fill bookkeeping resets.
-      highSinceExit = closes.length > 0 ? closes[closes.length - 1]! : 0;
-      peakClose = 0;
-      fillPrice = 0;
+
+    const holdingNow = state.positions.has(ASSET);
+    if (heldLastBatch && !holdingNow) {
+      bestCloseAfterExit = closeHistory.length > 0 ? closeHistory[closeHistory.length - 1]! : 0;
+      bestCloseInTrade = 0;
+      entryFillPrice = 0;
     }
-    wasHolding = holding;
+    heldLastBatch = holdingNow;
 
-    if (state.warmingUp || closes.length === 0) return [];
+    if (state.warmingUp || closeHistory.length === 0) return [];
 
-    if (holding) {
-      if (!exitSignal()) return [];
-      const held = state.positions.get(SYMBOL)!;
-      const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
-      return [sell];
+    if (holdingNow) {
+      if (!wantsExit()) return [];
+      const position = state.positions.get(ASSET)!;
+      const sellAll: SellInput = {
+        side: 'sell',
+        symbol: ASSET,
+        qty: position.qty,
+        max_slippage_bps: SLIPPAGE_CAP,
+      };
+      return [sellAll];
     }
 
-    if (!entrySignal(state)) return [];
-    const room = state.weightRoom(SYMBOL);
+    if (!wantsEntry()) return [];
+    const room = state.weightRoom(ASSET);
     const stake = state.cash < room ? state.cash : room;
     if (stake < BigInt(state.hello.fees.min_notional_quote_units)) return [];
-    const buy: BuyInput = { side: 'buy', symbol: SYMBOL, notional_quote_units: stake, max_slippage_bps: MAX_SLIPPAGE_BPS };
-    return [buy];
+    const buyAll: BuyInput = {
+      side: 'buy',
+      symbol: ASSET,
+      notional_quote_units: stake,
+      max_slippage_bps: SLIPPAGE_CAP,
+    };
+    return [buyAll];
   },
 });
